@@ -1,1 +1,160 @@
+name: CI/CD Pipeline for LLaMA Server
 
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+env:
+  # Updated for Docker Hub instead of GHCR
+  REGISTRY: docker.io
+  IMAGE_NAME: ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Cache Docker layers for faster builds
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # Updated login step for Docker Hub
+      - name: Log into Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          # Use Docker Hub registry with username and token from secrets
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      # Extract metadata for the Docker image
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # Updated image reference for Docker Hub
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=ref,event=branch
+            type=sha,format=long
+
+      # Build and push Docker image
+      - name: Build and push Docker image
+        id: build-and-push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache-new,mode=max
+
+      # Move cache to prevent cache growth
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache
+
+      # Install kubectl and kind
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install Kind
+        uses: helm/kind-action@v1.8.0
+        with:
+          install_only: true
+
+      - name: Create Kind cluster
+        run: |
+          chmod +x ./scripts/setup-kind.sh
+          ./scripts/setup-kind.sh
+
+      - name: Install Helm
+        uses: azure/setup-helm@v3
+        with:
+          version: 'v3.12.3'
+
+      # Add Helm repos
+      - name: Add Helm repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+      # Deploy Prometheus and Grafana
+      - name: Deploy monitoring
+        run: |
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install prometheus prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --values ./monitoring/prometheus-values.yaml \
+            --wait
+
+      # Fetch built image to Kind - updated for Docker Hub image reference
+      - name: Load Docker image to Kind
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            # For PRs, build locally without pushing
+            docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest -f ./docker/Dockerfile .
+            kind load docker-image ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest --name llama-cluster
+            IMAGE_REF="${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest"
+          else
+            # For pushes, pull the pushed image
+            IMAGE_REF="${{ steps.meta.outputs.tags }}"
+            docker pull ${IMAGE_REF}
+            kind load docker-image ${IMAGE_REF} --name llama-cluster
+          fi
+          echo "IMAGE_REF=${IMAGE_REF}" >> $GITHUB_ENV
+
+      # Deploy app using Helm
+      - name: Deploy LLaMA server with Helm
+        run: |
+          kubectl create namespace llama --dry-run=client -o yaml | kubectl apply -f -
+          helm upgrade --install llama-server ./helm/llama-server \
+            --namespace llama \
+            --set image.repository=${{ secrets.DOCKER_HUB_USERNAME }}/llama-server \
+            --set image.tag=${{ github.sha }} \
+            --set image.pullPolicy=IfNotPresent \
+            --wait
+
+      # Verify deployment
+      - name: Verify deployment
+        run: |
+          echo "Waiting for LLaMA server to be ready..."
+          kubectl -n llama rollout status deployment/llama-server
+          echo "Verifying metrics endpoint..."
+          kubectl -n llama port-forward svc/llama-server 9090:9090 &
+          sleep 5
+          curl -s http://localhost:9090/metrics | grep llama
+          
+      - name: Get service URLs
+        run: |
+          echo "LLaMA Server is available at: http://localhost:30080"
+          echo "Metrics endpoint is available at: http://localhost:30090/metrics"
+          echo "Prometheus UI is available at: http://localhost:30900"
+          echo "Grafana is available at: http://localhost:30300 (admin/admin)"
