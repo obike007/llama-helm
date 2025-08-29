@@ -47,7 +47,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=ref,event=branch
-            type=sha,format=long
+            type=sha,prefix=sha-,format=short
 
       # Build and push Docker image
       - name: Build and push Docker image
@@ -88,13 +88,48 @@ jobs:
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
 
-      # Deploy minimal monitoring stack with timeout and retry logic
+      # Deploy minimal monitoring stack with simplified values
       - name: Deploy monitoring
         run: |
           kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
           
-          # Create minimal CI values on-the-fly
+          # Create simplified values for Prometheus
           cat > monitoring/prometheus-values-ci.yaml << EOF
+          alertmanager:
+            enabled: false
+            
+          kubeStateMetrics:
+            enabled: false
+            
+          nodeExporter:
+            enabled: false
+            
+          prometheusOperator:
+            admissionWebhooks:
+              enabled: false
+            resources:
+              limits:
+                cpu: 100m
+                memory: 128Mi
+              requests:
+                cpu: 50m
+                memory: 64Mi
+                
+          prometheus:
+            enabled: true
+            service:
+              type: NodePort
+              nodePort: 30900
+            prometheusSpec:
+              retention: 1h
+              resources:
+                limits:
+                  cpu: 250m
+                  memory: 256Mi
+                requests:
+                  cpu: 100m
+                  memory: 128Mi
+                  
           grafana:
             enabled: true
             adminPassword: "admin"
@@ -108,47 +143,6 @@ jobs:
               requests:
                 cpu: 50m
                 memory: 64Mi
-            dashboards:
-              default:
-                llama-dashboard:
-                  json: $(cat monitoring/dashboards/llama-dashboard.json | jq -c '.')
-          
-          prometheus:
-            enabled: true
-            service:
-              type: NodePort
-              nodePort: 30900
-            prometheusSpec:
-              retention: 1h
-              serviceMonitorSelectorNilUsesHelmValues: false
-              serviceMonitorSelector: {}
-              resources:
-                limits:
-                  cpu: 250m
-                  memory: 256Mi
-                requests:
-                  cpu: 100m
-                  memory: 128Mi
-          
-          prometheusOperator:
-            resources:
-              limits:
-                cpu: 100m
-                memory: 128Mi
-              requests:
-                cpu: 50m
-                memory: 64Mi
-            admissionWebhooks:
-              enabled: false
-          
-          alertmanager:
-            enabled: false
-          
-          kubeStateMetrics:
-            enabled: false
-          
-          nodeExporter:
-            enabled: false
           EOF
           
           # Try installation with retries
@@ -162,6 +156,8 @@ jobs:
               break
             else
               echo "Prometheus installation attempt $i failed, retrying..."
+              # Clean up potential failed resources
+              kubectl -n monitoring delete service,deployment,statefulset,configmap,pod,secret --all --grace-period=0 --force || true
               if [ $i -eq 3 ]; then
                 echo "Warning: Prometheus installation failed after 3 attempts, continuing with deployment anyway"
               fi
@@ -170,30 +166,51 @@ jobs:
             fi
           done
 
-      # Fetch built image to Kind
+      # Fetch built image to Kind - FIXED for both pull request and push scenarios
       - name: Load Docker image to Kind
         run: |
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             # For PRs, build locally without pushing
-            docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest .
-            kind load docker-image ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest --name llama-cluster
-            IMAGE_REF="${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:latest"
+            echo "Building local image for pull request..."
+            docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:pr-${{ github.event.pull_request.number }} .
+            kind load docker-image ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:pr-${{ github.event.pull_request.number }} --name llama-cluster
+            echo "IMAGE_TAG=pr-${{ github.event.pull_request.number }}" >> $GITHUB_ENV
           else
-            # For pushes, pull the pushed image
-            IMAGE_REF="${{ steps.meta.outputs.tags }}"
-            docker pull ${IMAGE_REF}
-            kind load docker-image ${IMAGE_REF} --name llama-cluster
+            # For pushes, pull the pushed image using the first tag
+            echo "Getting tags from metadata action..."
+            TAGS_JSON='${{ steps.meta.outputs.json }}'
+            FIRST_TAG=$(echo $TAGS_JSON | jq -r '.tags[0]')
+            echo "First tag: $FIRST_TAG"
+            
+            if [ -z "$FIRST_TAG" ] || [ "$FIRST_TAG" = "null" ]; then
+              # Fallback to building locally if no tag is available
+              echo "No tags found, building locally..."
+              docker build -t ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:sha-${{ github.sha }} .
+              IMAGE_TAG="sha-${{ github.sha }}"
+            else
+              echo "Pulling image: $FIRST_TAG"
+              docker pull $FIRST_TAG
+              # Extract just the tag portion from the full image reference
+              IMAGE_TAG=$(echo "$FIRST_TAG" | cut -d ':' -f 2)
+              echo "Extracted tag: $IMAGE_TAG"
+            fi
+            
+            kind load docker-image ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:$IMAGE_TAG --name llama-cluster
+            echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           fi
-          echo "IMAGE_REF=${IMAGE_REF}" >> $GITHUB_ENV
 
       # Deploy app using Helm
       - name: Deploy LLaMA server with Helm
         run: |
           kubectl create namespace llama --dry-run=client -o yaml | kubectl apply -f -
+          
+          # Show the image tag being used
+          echo "Using image: ${{ secrets.DOCKER_HUB_USERNAME }}/llama-server:${{ env.IMAGE_TAG }}"
+          
           helm upgrade --install llama-server ./helm/llama-server \
             --namespace llama \
             --set image.repository=${{ secrets.DOCKER_HUB_USERNAME }}/llama-server \
-            --set image.tag=${{ github.sha }} \
+            --set image.tag=${{ env.IMAGE_TAG }} \
             --set image.pullPolicy=IfNotPresent \
             --timeout 10m
 
