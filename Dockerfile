@@ -14,7 +14,7 @@ RUN apt-get update && apt-get install -y \
 # Build llama.cpp
 WORKDIR /tmp/build
 
-# Download and extract llama.cpp
+# Download and extract llama.cpp (more reliable than git clone)
 RUN wget -O llama-cpp.tar.gz https://github.com/ggerganov/llama.cpp/archive/refs/heads/master.tar.gz && \
     tar -xzf llama-cpp.tar.gz && \
     mv llama.cpp-master llama.cpp
@@ -60,12 +60,18 @@ RUN mkdir -p /models /app/metrics /etc/supervisor/conf.d && \
 COPY --from=builder /tmp/build/llama.cpp/build/bin/llama-server /usr/local/bin/llama-server
 RUN chmod +x /usr/local/bin/llama-server
 
-# Copy shared libraries if they exist
-COPY --from=builder /tmp/build/llama.cpp/build/bin/*.so /usr/local/lib/ 2>/dev/null || true
-COPY --from=builder /tmp/build/llama.cpp/build/lib/*.so /usr/local/lib/ 2>/dev/null || true
+# Copy shared libraries if they exist - FIXED VERSION
+RUN mkdir -p /usr/local/lib
+# Use shell command to safely copy if files exist
+RUN if [ -n "$(find /tmp/build/llama.cpp/build/bin -name '*.so' 2>/dev/null || echo)" ]; then \
+      cp -v /tmp/build/llama.cpp/build/bin/*.so /usr/local/lib/ 2>/dev/null || true; \
+    fi && \
+    if [ -n "$(find /tmp/build/llama.cpp/build/lib -name '*.so' 2>/dev/null || echo)" ]; then \
+      cp -v /tmp/build/llama.cpp/build/lib/*.so /usr/local/lib/ 2>/dev/null || true; \
+    fi
 RUN ldconfig
 
-# Create metrics exporter script with FIXED counter implementation
+# Create metrics exporter script with fixed counter implementation
 RUN cat > /app/metrics/exporter.py << 'EOF'
 #!/usr/bin/env python3
 import time
